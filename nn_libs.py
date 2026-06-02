@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import LinearLR
 from torch.utils.data import DataLoader, Dataset, Subset, random_split, ConcatDataset
 import matplotlib.pyplot as plt
 import h5py
@@ -11,13 +12,37 @@ import numpy as np
 import os
 import math
 import gc
+import optuna
+from optuna.pruners import MedianPruner
 
 @dataclass
 class hyper_parameters:
-    y_dim: int = 3
-    u_dim: int = 32
-    z_dim: int = 1024
-    num_layers: int = 4
+    # Architecture
+    y_dim: int = 3         # Strain input dimension (Voigt: E11, E22, E12)
+    u_dim: int = 32        # Latent geometry dimension (Z from Encoder)
+    z_dim: int = 512       # Hidden dimension for cICNN physics layers
+    num_layers: int = 4    # Number of hidden cICNN layers
+    
+    # Training Loop
+    epochs: int = 500
+    batch_size: int = 256
+    str_sample: int = 600
+    lr: float = 1e-3
+    weight_decay: float = 1e-4  # AdamW penalty (crucial for smooth manifolds)
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+    stress_weight: float = 1.0
+    phys_weight: float = 1.0
+    kl_weight: float = 0.1
+    varW: float = 1.0
+    varS: float = 1.0
+    nats_per_dim: float = 2.5
+    # Checkpointing
+    save: bool = False
+    save_every_n_epochs: int = 50
+    checkpoint_dir: str = "./checkpoints"
+    
+    #optuna yes/no
+    hp_sweep: bool = False
     
 class cICNN_layer(nn.Module):
     def __init__(self, config: hyper_parameters):
@@ -35,7 +60,6 @@ class cICNN_layer(nn.Module):
         init_mean = math.log(math.exp(target_post_softplus) - 1.0) 
         
         nn.init.normal_(self.W_z.weight, mean=init_mean, std=0.01)
-        # nn.init.normal_(self.W_z.weight, mean=0, std=0.1)
         
         # strain contribution
         self.W_u  = nn.Linear(config.u_dim, config.z_dim, bias=True) 
@@ -43,8 +67,6 @@ class cICNN_layer(nn.Module):
         # cross attention contribution
         self.W_yu = nn.Linear(config.u_dim, config.y_dim, bias=True)
         self.W_y  = nn.Linear(config.y_dim, config.z_dim, bias=False) 
-        self.W_y0 = nn.Linear(config.y_dim, config.z_dim, bias=False) 
-        self.W_y1 = nn.Linear(config.y_dim, config.z_dim, bias=False) 
         
     def forward(self, inputs):
         y, u_i, z_i = inputs
@@ -53,34 +75,27 @@ class cICNN_layer(nn.Module):
         u_next = F.silu(self.W_uu(u_i))
         
         # CONVEX UPDATE: z_{i+1}
-        # Term 1: Wz.(z*(Wzu.u+b)+) #latent path 
+
         zu_p = z_i * F.softplus(self.W_zu(u_i)) 
+       
         term1 = F.linear(zu_p, F.softplus(self.W_z.weight)) 
-        # term1 =  self.W_z(z_i * self.W_zu(u_i))
-        # Term 2: Wy.(y*(Wyu.u+b)+) #cross attention path
+
         input_gate = self.W_yu(u_i) 
         yu = y * input_gate 
         term2 = self.W_y(yu)
-        
-        # Term 3: strain path 
+      
         term3 = self.W_u(u_i)
         
-        term4 = self.W_y0(y)
-        
-        term5 = self.W_y1(y*y)
-        
-        z_next = F.softplus(term1 + term2 + term3)
+        terms = term1 + term2 + term3
+        z_next = F.softplus(terms)**2 + 0.01*terms
         return (y, u_next, z_next)
-        
+    
 class cICNN_NN(nn.Module):
     def __init__(self, config: hyper_parameters):
         super().__init__()
         
         # 1. Initial Processing of Latent Geometry (Z from your VAE)
-        self.u_init = nn.Sequential(
-            nn.Linear(config.u_dim, config.u_dim),
-            nn.SiLU()
-        )
+        self.u_init = nn.Linear(config.u_dim, config.u_dim)
         
         # Layer 0 
         # z_1 = Softplus(W_y y + W_u u_0 + b)
@@ -92,13 +107,13 @@ class cICNN_NN(nn.Module):
             layers.append(cICNN_layer(config))
         
         self.hidden_layers = nn.Sequential(*layers)
-        self.final_layer = nn.Linear(config.z_dim, 1, bias=True)
+        self.final_layer = nn.Linear(config.z_dim, 1, bias=False)
         
         target_post_softplus = 1.0 / config.z_dim
         init_mean = math.log(math.exp(target_post_softplus) - 1.0) 
         
         nn.init.normal_(self.final_layer.weight, mean=init_mean, std=0.01)
-
+        # nn.init.normal_(self.final_layer.weight, mean=0, std=0.01)
     def _forward_raw(self, y, u):
         while u.dim() < y.dim(): u = u.unsqueeze(1)
         u_0 = self.u_init(u)
@@ -106,8 +121,9 @@ class cICNN_NN(nn.Module):
         
         _, _, z_out = self.hidden_layers((y, u_0, z_1))
         
-        W_pred = F.softplus(F.linear(z_out, F.softplus(self.final_layer.weight), self.final_layer.bias))
-        
+        W_unact = F.linear(z_out, F.softplus(self.final_layer.weight))
+        W_pred = F.softplus(W_unact)**2 + 0.01*W_unact
+        # W_pred
         return W_pred
     
     def forward(self, strain, geometry):
@@ -183,7 +199,7 @@ class VAE_decoder(nn.Module):
         reconstruction = self.decoder(hidden)
         return reconstruction
 
-class surrogateNN(nn.Module):
+class surrogateNN_VAE(nn.Module):
     def __init__(self, config: hyper_parameters):
         super().__init__()
         self.encoder = VAE_encoder(config)
@@ -197,7 +213,17 @@ class surrogateNN(nn.Module):
         
         return W_phys, reconstruction, mu, logvar
     
-    
+class surrogateNN(nn.Module):
+    def __init__(self, config: hyper_parameters):
+        super().__init__()
+        self.encoder = VAE_encoder(config)
+        self.energy_predictor = cICNN_NN(config)
+
+    def forward(self, geometry, strains):
+        z, mu, logvar = self.encoder(geometry)
+        W_phys = self.energy_predictor(strains, z)
+        
+        return W_phys, None, mu, logvar    
 class VRAMStorage:
     """Loads HDF5 data into VRAM, pre-computes physical fields, and excludes NaNs/Infs."""
     @torch.no_grad()
@@ -303,8 +329,8 @@ class VRAMStorage:
         print("\nApplying Origin-Preserving Global Scaling...")
         
         #alternate scaling
-        self.std_E = torch.max(torch.abs(self.strains[:,:,-1,...]))
-        self.std_W = torch.max(torch.abs(self.energies[:,:,-1,...]))
+        self.std_E = torch.max(torch.abs(self.strains))
+        self.std_W = torch.max(torch.abs(self.energies))
 
         # self.std_E = torch.std(self.strains)
         # self.std_W = torch.std(self.energies)
@@ -389,41 +415,62 @@ class FlattenedStrainDataset(Dataset):
 
         return image, single_strain, single_energy, single_stress
     
-def compute_loss(W_pred, W_true, S_pred, S_true, recon_images, real_images, mu, logvar, tau=1/15, varW=1, varS=1, beta=0.0005, stress_weight=0.01, physics_weight=1):
+def compute_loss(W_pred, W_true, S_pred, S_true, recon_images, real_images, mu, logvar, kl_targ=80,stress_weight=0.01, phys_weight=1.0,kl_weight=0.0, varW=1.0, varS=1.0):
     
     # Physics Loss: Mean Squared Error of the Strain Energy Density
-    # epsilon=1e-8
-    # loss_energy = F.mse_loss((epsilon+W_pred)/(epsilon+W_true.unsqueeze(-1)), torch.ones_like(W_pred))
-    # loss_stress = F.mse_loss((epsilon+S_pred)/(epsilon+S_true), torch.ones_like(S_pred))
-    
-    # energy_residual = ((W_pred - W_true.unsqueeze(-1)) / math.sqrt(varW))**2
-    # stress_residual = (((S_pred - S_true) / math.sqrt(varS))**2 ).sum(dim=-1)
-    
-    # loss_energy = (tau * torch.logsumexp(energy_residual / tau,dim=1)).mean()
-    # loss_stress = (tau * torch.logsumexp(stress_residual / tau,dim=1)).mean()
-    
-    # loss_energy = F.mse_loss(W_pred, W_true.unsqueeze(-1)) / (varW + 1e-8)
-    # loss_stress = F.mse_loss(S_pred, S_true) / (varS + 1e-8)
-    
-    # loss_energy = F.mse_loss(W_pred, W_true.unsqueeze(-1)) 
-    # loss_stress = F.mse_loss(S_pred, S_true) 
+    # loss_energy = F.mse_loss(torch.log(1e-6+W_pred), torch.log(1e-6+W_true.unsqueeze(-1)))#/varW
+    loss_energy = F.mse_loss(W_pred, W_true.unsqueeze(-1))/varW
+    loss_stress = F.mse_loss(S_pred, S_true)/varS
 
-    loss_energy = F.mse_loss(torch.log(1e-6 + W_pred), torch.log(1e-6 + W_true.unsqueeze(-1))) 
-    loss_stress = F.mse_loss(S_pred, S_true) 
+    # loss_energy = F.mse_loss((W_pred/W_true.unsqueeze(-1)),torch.ones_like(W_pred))
+    # loss_stress = F.mse_loss((S_pred+1e-3)/(S_true+1e-3), torch.ones_like(S_pred))
+
     loss_phys = loss_energy + stress_weight * loss_stress
-    
-    # VAE Reconstruction Loss
-    loss_recon = F.mse_loss(recon_images, real_images)
     
     # VAE KL Divergence
     loss_kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
     loss_kl = loss_kl / real_images.size(0) # Normalize by batch size
     
-    total_loss = (physics_weight * loss_phys) #+ loss_recon + (beta * loss_kl)
-    loss_AE = loss_recon + (beta * loss_kl)
+    total_loss =  phys_weight*loss_phys + kl_weight*torch.abs(loss_kl - kl_targ)
+    loss_AE =  loss_kl
     return total_loss, loss_AE, loss_energy, loss_stress
 
-def train_model(model, train_dataloader, val_dataloader, varW=1, varS=1, frozen=None, epochs=100, lr=1e-3, device='cuda'):
+def save_model_checkpoint(epoch, model, optimizer, config, loss_val):
+    """Saves the network state safely to disk."""
+    os.makedirs(config.checkpoint_dir, exist_ok=True)
+    
+    checkpoint_path = os.path.join(config.checkpoint_dir, f"surrogate_epoch_{epoch}.pth")
+    
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': loss_val,
+        # Save the config so you can easily rebuild the exact architecture during inference
+        'config': config 
+    }, checkpoint_path)
+    
+    print(f"--> [Checkpoint Saved] Epoch {epoch} at {checkpoint_path}")
+def get_weights_epoch(epoch,config):
+    Tmin = 20
+    Tmax = min(100+Tmin,config.epochs//2)
+    
+    t = torch.clamp((torch.tensor(epoch)  - Tmin)/(Tmax - Tmin), min=0, max=1)
+    str_max  = config.stress_weight 
+    kl_max   = config.kl_weight 
+    st_wt    = (str_max/2)*(1-torch.cos(t*torch.pi))
+    kl_wt    =  (kl_max/2)*(1-torch.cos(t*torch.pi))
+    return st_wt.item(), kl_wt.item()
+    
+def train_model(model, train_dataloader, val_dataloader, config, trial=None):
+    
+    varW, varS = config.varW, config.varS
+    str_sample = config.str_sample
+    frozen=None
+    epochs,lr,wd = config.epochs, config.lr, config.weight_decay
+    device = config.device
+    st_wt, p_wt, kl_wt = config.stress_weight, config.phys_weight, config.kl_weight
+    kl_t = config.u_dim*config.nats_per_dim
     for param in model.parameters():
         param.requires_grad = True
     if frozen is not None:
@@ -452,11 +499,18 @@ def train_model(model, train_dataloader, val_dataloader, varW=1, varS=1, frozen=
     # Pass ONLY parameters that require gradients to the optimizer
     active_parameters = [p for p in model.parameters() if p.requires_grad]
     
-    optimizer = AdamW(active_parameters, lr=lr, weight_decay=1e-4)
+    optimizer = AdamW(active_parameters, lr=lr, weight_decay=wd)
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.001, total_iters=20)
     model.to(device)
+    # apply_convexity_constraints(model)
     
     import time
+    from collections import deque
+    best_val_loss = float('inf')
     
+    # Store the last N validation losses
+    history_window = 10 
+    recent_val_losses = deque(maxlen=history_window)
     for epoch in range(epochs):
         # ==========================
         #       TRAINING PHASE
@@ -467,21 +521,26 @@ def train_model(model, train_dataloader, val_dataloader, varW=1, varS=1, frozen=
         epoch_energy = 0.0
         epoch_stress = 0.0
         start_time = time.time()
-        
+        st_wt, kl_wt = get_weights_epoch(epoch,config)
         for batch_idx, (images, strains_all, energies_true, stresses_true) in enumerate(train_dataloader):
             images = images.to(device, dtype=torch.float32)
             strains_all = strains_all.to(device, dtype=torch.float32)
             energies_true = energies_true.to(device, dtype=torch.float32)
             stresses_true = stresses_true.to(device, dtype=torch.float32)
             
-            strains_all = strains_all.flatten(1,2)
-            total_strain_points = strains_all.shape[1]
-            str_sample = total_strain_points
-            random_indices = torch.randint(0, total_strain_points, (str_sample,), device=device)
+            if str_sample is None: 
+                strains       =   strains_all.flatten(1,2)
+                energies_true = energies_true.flatten(1,2)
+                stresses_true = stresses_true.flatten(1,2)
             
-            strains = strains_all[:,random_indices,...]
-            energies_true = energies_true.flatten(1,2)[:,random_indices,...]
-            stresses_true = stresses_true.flatten(1,2)[:,random_indices,...]
+            else:
+                total_strain_points = strains_all.shape[1]*strains_all.shape[2]
+                random_indices = torch.randint(0, total_strain_points, (str_sample,), device=device)
+
+                strains       =   strains_all.flatten(1,2)[:,random_indices,...]
+                energies_true = energies_true.flatten(1,2)[:,random_indices,...]
+                stresses_true = stresses_true.flatten(1,2)[:,random_indices,...]
+                # print(strains.shape)
             
             strains.requires_grad_(True)
             optimizer.zero_grad()
@@ -494,22 +553,19 @@ def train_model(model, train_dataloader, val_dataloader, varW=1, varS=1, frozen=
             
             loss, l_ae, l_energy, l_stress = compute_loss(
                 W_pred, energies_true, S_pred, stresses_true, recon_images, images, mu, logvar,
-                varW=varW,varS=varS)
+                varW=varW,varS=varS,stress_weight=st_wt, phys_weight=p_wt, kl_weight=kl_wt, kl_targ=kl_t)
             
             # Backward pass and optimize
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            # for name, p in model.named_parameters():
-            #     if p.grad is not None:
-            #         print(name, p.grad.abs().mean())
         
             optimizer.step()
             
-            epoch_loss += l_ae.item()
-            epoch_energy += l_energy.item()
-            epoch_stress += l_stress.item()
             
+            epoch_loss += l_ae.detach().item()
+            epoch_energy += l_energy.detach().item()
+            epoch_stress += l_stress.detach().item()
+        warmup_scheduler.step()    
         avg_train_loss = epoch_loss / len(train_dataloader)
         avg_train_energy = epoch_energy / len(train_dataloader)
         avg_train_stress = epoch_stress / len(train_dataloader)
@@ -529,15 +585,21 @@ def train_model(model, train_dataloader, val_dataloader, varW=1, varS=1, frozen=
             val_energies = val_energies.to(device, dtype=torch.float32)
             val_stresses = val_stresses.to(device, dtype=torch.float32)
             
-            val_strains = val_strains.flatten(1,2)
-            total_strain_points = val_strains.shape[1]
-            str_sample = total_strain_points
-            random_indices = torch.randint(0, total_strain_points, (str_sample,), device=device)
+            val_strains = val_strains
+            if str_sample is None: 
+                val_strains  =  val_strains.flatten(1,2)
+                val_energies = val_energies.flatten(1,2)
+                val_stresses = val_stresses.flatten(1,2)
             
-            val_strains = val_strains[:,random_indices,...]
-            val_energies = val_energies.flatten(1,2)[:,random_indices,...]
-            val_stresses = val_stresses.flatten(1,2)[:,random_indices,...]
+            else:
+                total_strain_points = val_strains.shape[1]*val_strains.shape[2]
+                random_indices = torch.randint(0, total_strain_points, (str_sample,), device=device)
+
+                val_strains  =  val_strains.flatten(1,2)[:,random_indices,...]
+                val_energies = val_energies.flatten(1,2)[:,random_indices,...]
+                val_stresses = val_stresses.flatten(1,2)[:,random_indices,...]
             
+
             val_strains.requires_grad_(True)
             
             # Forward pass
@@ -548,11 +610,11 @@ def train_model(model, train_dataloader, val_dataloader, varW=1, varS=1, frozen=
             
             val_loss, vl_ae, l_energy_val, l_stress_val = compute_loss(
                 W_pred_val, val_energies, S_pred_val, val_stresses, recon_val, val_images, mu_val, logvar_val,
-                varW=varW,varS=varS)
+                varW=varW,varS=varS,stress_weight=st_wt, phys_weight=p_wt, kl_targ=kl_t)
             
-            val_epoch_loss += l_ae.item()
-            val_epoch_energy += l_energy_val.item()
-            val_epoch_stress += l_stress_val.item()
+            val_epoch_loss += l_ae.detach().item()
+            val_epoch_energy += l_energy_val.detach().item()
+            val_epoch_stress += l_stress_val.detach().item()
             
         avg_val_loss = val_epoch_loss / len(val_dataloader)
         avg_val_energy = val_epoch_energy / len(val_dataloader)
@@ -564,7 +626,44 @@ def train_model(model, train_dataloader, val_dataloader, varW=1, varS=1, frozen=
         print(f"Epoch [{epoch+1}/{epochs}] Time: {time.time() - start_time:.1f}s")
         print(f"  [Train] AE Loss: {avg_train_loss:.4f} | Energy MSE: {avg_train_energy:.6f} | Stress MSE: {avg_train_stress:.6f}")
         print(f"  [Val]   AE Loss: {avg_val_loss:.4f} | Energy MSE: {avg_val_energy:.6f} | Stress MSE: {avg_val_stress:.6f}\n")
+        if config.save==True and epoch%50==0:
+            save_model_checkpoint(epoch, model, optimizer, config, avg_train_loss)
         
+        if trial is not None:
+            trial.report(val_loss, epoch)
+            if trial.should_prune():
+                raise optuna.exceptions.TrialPruned()
+            if math.isnan(avg_val_loss) or math.isinf(avg_val_loss):
+                raise optuna.exceptions.TrialPruned()
         
-        
+        diff = np.abs(avg_val_loss/kl_t - 1)
+        if diff > 0.1:
+            out_loss = 100 + avg_val_energy + st_wt*avg_val_stress
+        else:
+            out_loss = avg_val_energy + st_wt*avg_val_stress
+        recent_val_losses.append(out_loss)
     
+    best_val_loss = min(recent_val_losses) if recent_val_losses else float('inf')     
+    if config.save==True: save_model_checkpoint(epoch, model, optimizer, config, avg_train_loss)
+    return best_val_loss
+              
+def optuna_objective(trial, train_dataset, val_dataset):
+
+    config = hyper_parameters(  epochs        =  200,
+                                u_dim         =  trial.suggest_categorical("u_dim", [8, 16, 32, 64]),
+                                z_dim         =  trial.suggest_categorical("z_dim", [64, 128, 266, 512]),
+                                num_layers    =  trial.suggest_int("num_layers", 2, 6),
+                                lr            =  trial.suggest_float("lr", 1e-5, 1e-2, log=True),
+                                weight_decay  =  trial.suggest_float("weight_decay", 1e-5, 1e-2, log=True),
+                                batch_size    =  trial.suggest_categorical("batch_size", [8, 16, 32, 64, 128, 256]),
+                                str_sample    =  trial.suggest_categorical("str_sample", [32, 64, 128, 256, 512, 1024]),
+                                stress_weight =  trial.suggest_float("stress_weight", 1e-3, 10, log=True),
+                                kl_weight     =  trial.suggest_float("kl_weight", 1e-6, 1.0, log=True)
+                              )
+    dataloader_train = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=0, pin_memory=False)
+    dataloader_val   = DataLoader(val_dataset,   batch_size=config.batch_size, shuffle=False,num_workers=0, pin_memory=False)
+
+    model = surrogateNN(config)
+    loss  = train_model(model, dataloader_train, dataloader_val, config, trial=trial)
+    
+    return loss
