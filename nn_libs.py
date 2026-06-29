@@ -36,6 +36,7 @@ class hyper_parameters:
     kl_weight: float = 0.1
     varW: float = 1.0
     varS: float = 1.0
+    varC: float = 1.0
     nats_per_dim: float = 2.5
     # Checkpointing
     save: bool = False
@@ -145,23 +146,22 @@ class cICNN_NN(nn.Module):
         """ This enforce 0 energy,stress at 0 strain """
         if not strain.requires_grad:
             strain.requires_grad_(True)
-            
-        W_e = self._forward_raw(strain, geometry)
-        # strain_zero = torch.zeros_like(strain, requires_grad=True)
+        strain_n = strain.clone()
+        strain_n[..., -1] *= -1.0
+        
+        W_e_pos = self._forward_raw(strain, geometry)
+        W_e_neg = self._forward_raw(strain_n, geometry)
+        
+        W_e_sym = 0.5 * (W_e_pos + W_e_neg)
+        
         strain_zero = torch.full_like(strain, fill_value=1e-7, requires_grad=True)
         W_zero = self._forward_raw(strain_zero, geometry)
         
         S_zero = torch.autograd.grad(W_zero, strain_zero, torch.ones_like(W_zero), create_graph=True)[0]
-        # S_zero[...,-1] *= 0.5
         linear_offset = torch.sum(S_zero * strain, dim=-1, keepdim=True)
-        W_phys = W_e - W_zero - linear_offset
         
-        # E_tensor = torch.stack([torch.stack([strain[..., 0], strain[..., 2]], dim=-1),torch.stack([strain[..., 2], strain[..., 1]], dim=-1)],dim=-1)
-        # detF = torch.sqrt(torch.clamp(torch.det(2*E_tensor + torch.eye(2,device=E_tensor.device)),min=0))
-        # # print(torch.det(2*E_tensor + torch.eye(2,device=E_tensor.device)))
-        # # raise
-        # W_vol = ((detF + 1/detF - 2)**2).unsqueeze(-1)
-        # W_phys += W_vol
+        W_phys = W_e_sym - W_zero - linear_offset
+        
         return W_phys
 
     def _forward(self, strain, geometry):
@@ -409,6 +409,7 @@ class VRAMStorage:
         # self.std_E = torch.max(torch.abs(self.strains))
         # self.std_W = torch.std(self.energies)
         self.std_E = 0.3450 
+        # self.std_E = 1 
         self.std_W = 0.0021 
         print("\nscales done")
         self.strains  *= 1 / self.std_E
@@ -471,10 +472,6 @@ class MetaMaterialDatasetPL(Dataset):
 #             # Swap 11 and 22, and multiply 12 by -1
 #             strain = strain[..., [1, 0, 2]] * self.voigt_rot_mult
 #             stress = stress[..., [1, 0, 2]] * self.voigt_rot_mult
-        # if True:
-        #     mask = torch.rand_like(strain[..., -1]) > 0.5
-        #     strain[..., -1][mask] *= -1
-        #     stress[..., -1][mask] *= -1
         # if self.augment:
         #     image = torch.roll(image, shifts=(), dims=(-2, -1))
             
@@ -546,12 +543,11 @@ def compute_loss(W_pred, W_true, S_pred0, S_true, recon_images, real_images, mu,
 
     return total_loss, loss_AE, loss_energy, loss_stress
 
-def compute_loss2(W_pred, W_true, S_pred0, S_true, C_pred, C_true, recon_images, real_images, mu, logvar, kl_targ=80,stress_weight=0.01, phys_weight=1.0,kl_weight=0.0, varW=1.0, varS=1.0):
+def compute_loss2(W_pred, W_true, S_pred0, S_true, C_pred, C_true, recon_images, real_images, mu, logvar, kl_targ=80,stress_weight=0.01, phys_weight=1.0,kl_weight=0.0, varW=1.0, varS=1.0, varC=1.0):
     
     # Physics Loss: Mean Squared Error of the Strain Energy Density
     # loss_energy = F.mse_loss(torch.log(1e-5+W_pred), torch.log(1e-5+W_true.unsqueeze(-1)))#/varW
-    multiplier = torch.tensor([1.0, 1.0, 0.5], device=S_pred0.device)
-    S_pred = S_pred0 * multiplier.view(1,1,3)
+    S_pred = S_pred0
     # S_pred = S_pred0.clone()
     # S_pred[...,-1] *= 0.5
     
@@ -562,13 +558,13 @@ def compute_loss2(W_pred, W_true, S_pred0, S_true, C_pred, C_true, recon_images,
     # loss_energy = F.huber_loss(W_pred/W_true.unsqueeze(-1) , torch.ones_like(W_pred), delta=0.3333)
     
     # loss_energy = F.mse_loss((W_pred/(W_true.unsqueeze(-1))),torch.ones_like(W_pred))#.pow(0.5)
-    loss_energy = F.mse_loss(W_pred, W_true.unsqueeze(-1))#/varW
-    loss_stress = F.mse_loss(S_pred, S_true)#/varS
-    loss_tangent = F.mse_loss(C_pred, C_true)#/varC
+    loss_energy = F.mse_loss(W_pred, W_true.unsqueeze(-1))/varW
+    loss_stress = F.mse_loss(S_pred, S_true)/varS
+    loss_tangent = F.mse_loss(C_pred, C_true)/varC
 
     # loss_stress = F.mse_loss((S_pred+1e-3)/(S_true+1e-3), torch.ones_like(S_pred))
 
-    loss_phys = loss_energy + stress_weight * loss_stress + stress_weight * loss_tangent
+    loss_phys = loss_energy + stress_weight * loss_stress + 10*stress_weight * loss_tangent
     
     # VAE KL Divergence
     loss_kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
@@ -639,7 +635,7 @@ def count_convexity_constraints(model,min_w=1e-6):
     return tot, dead
 
 def train_model(model, train_dataloader, val_dataloader, config, trial=None):
-    varW, varS = config.varW, config.varS
+    varW, varS, varC = config.varW, config.varS, config.varC
     str_sample = config.str_sample
     frozen=None
     epochs,lr,wd = config.epochs, config.lr, config.weight_decay
@@ -740,7 +736,7 @@ def train_model(model, train_dataloader, val_dataloader, config, trial=None):
             
             # Stresses using autograd
             S_pred = torch.autograd.grad(W_pred, strains, torch.ones_like(W_pred), create_graph=True)[0]
-            C_pred = torch.zeros(*strains.shape, 3,3, device=strains.device, dtype=strains.dtype)
+            C_pred = torch.zeros(*S_pred.shape[:-1], 3,3, device=strains.device, dtype=strains.dtype)
             for i in range(strains.shape[-1]):
                 grad_outputs = torch.zeros_like(S_pred)
                 grad_outputs[..., i] = 1.0
@@ -755,7 +751,7 @@ def train_model(model, train_dataloader, val_dataloader, config, trial=None):
             
             loss, l_ae, l_energy, l_stress = compute_loss2(
                 W_pred, energies_true, S_pred, stresses_true, C_pred, tangents_true, recon_images, images, mu, logvar,
-                varW=varW,varS=varS,stress_weight=st_wt, phys_weight=p_wt, kl_weight=kl_wt, kl_targ=kl_t)
+                varW=varW,varS=varS,varC=varC,stress_weight=st_wt, phys_weight=p_wt, kl_weight=kl_wt, kl_targ=kl_t)
             
             # Backward pass and optimize
             loss.backward()
@@ -809,21 +805,21 @@ def train_model(model, train_dataloader, val_dataloader, config, trial=None):
             
             # Stresses using autograd
             S_pred_val = torch.autograd.grad(W_pred_val, val_strains, torch.ones_like(W_pred_val), create_graph=True)[0]
-            C_pred_val = torch.zeros(*strains.shape, 3,3, device=strains.device, dtype=strains.dtype)
+            C_pred_val = torch.zeros(*S_pred_val.shape[:-1], 3,3, device=val_strains.device, dtype=val_strains.dtype)
             for i in range(strains.shape[-1]):
-                grad_outputs = torch.zeros_like(S_pred)
+                grad_outputs = torch.zeros_like(S_pred_val)
                 grad_outputs[..., i] = 1.0
 
                 C_pred_val[..., i, :] = torch.autograd.grad(
                     outputs=S_pred_val,
-                    inputs=strains,
+                    inputs=val_strains,
                     grad_outputs=grad_outputs,
                     create_graph=True,
                     retain_graph=True
                 )[0]
             val_loss, vl_ae, l_energy_val, l_stress_val = compute_loss2(
                 W_pred_val, val_energies, S_pred_val, val_stresses, C_pred_val,val_tangents, recon_val, val_images, mu_val, logvar_val,
-                varW=varW,varS=varS,stress_weight=st_wt, phys_weight=p_wt, kl_weight=kl_wt, kl_targ=kl_t)
+                varW=varW,varS=varS,varC=varC,stress_weight=st_wt, phys_weight=p_wt, kl_weight=kl_wt, kl_targ=kl_t)
             
             val_epoch_loss += vl_ae.detach().item()
             val_epoch_energy += l_energy_val.detach().item()
