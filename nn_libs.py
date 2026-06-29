@@ -45,49 +45,71 @@ class hyper_parameters:
     hp_sweep: bool = False
     
 class cICNN_layer(nn.Module):
-    def __init__(self, config: hyper_parameters):
+    def __init__(self, config: hyper_parameters, final=False):
         super().__init__()
-        ''' strain stream use "e", latent stream use "z" or "m" '''
-        # U-Path (Non-Convex Latent Space Input)
-        self.W_uu = nn.Linear(config.u_dim, config.u_dim, bias=True)
-        
-        # Z-Path (Convex Strain Input)
-        # latent space contribution
-        self.W_zu = nn.Linear(config.u_dim, config.z_dim, bias=True)
-        self.W_z  = nn.Linear(config.z_dim, config.z_dim, bias=False) 
-        
-        target_post_softplus = 1.0 / config.z_dim
-        init_mean = math.log(math.exp(target_post_softplus) - 1.0) 
-        
-        nn.init.normal_(self.W_z.weight, mean=init_mean, std=0.01)
-        
-        # strain contribution
-        self.W_u  = nn.Linear(config.u_dim, config.z_dim, bias=True) 
-        
-        # cross attention contribution
-        self.W_yu = nn.Linear(config.u_dim, config.y_dim, bias=True)
-        self.W_y  = nn.Linear(config.y_dim, config.z_dim, bias=False) 
+        self.final = final
+        if not self.final:
+            ''' strain stream use "e", latent stream use "z" or "m" '''
+            # U-Path (Non-Convex Latent Space Input)
+            self.W_uu = nn.Linear(config.u_dim, config.u_dim, bias=True)
+
+            # Z-Path (Convex Strain Input)
+            # latent space contribution
+            self.W_zu = nn.Linear(config.u_dim, config.z_dim, bias=True)
+            self.W_z  = nn.Linear(config.z_dim, config.z_dim, bias=False) 
+            
+            # target_post_softplus = 1.0 / config.z_dim
+            # init_mean = math.log(math.exp(target_post_softplus) - 1.0) 
+            # nn.init.normal_(self.W_z.weight, mean=init_mean, std=0.1)
+            
+            target = 1.0 / config.z_dim
+            nn.init.uniform_(self.W_z.weight, a=0.5 * target, b=1.5 * target)
+
+            # strain contribution
+            self.W_u  = nn.Linear(config.u_dim, config.z_dim, bias=True) 
+
+            # cross attention contribution
+            self.W_yu = nn.Linear(config.u_dim, config.y_dim, bias=True)
+            self.W_y  = nn.Linear(config.y_dim, config.z_dim, bias=False) 
+        else:
+
+            self.W_zu = nn.Linear(config.u_dim, config.z_dim, bias=True)
+            self.W_z  = nn.Linear(config.z_dim, 1, bias=False) 
+
+            # target_post_softplus = 1.0 / config.z_dim
+            # init_mean = math.log(math.exp(target_post_softplus) - 1.0) 
+            # nn.init.normal_(self.W_z.weight, mean=init_mean, std=0.1)
+            target = 1.0 / config.z_dim
+            nn.init.uniform_(self.W_z.weight, a=0.5 * target, b=1.5 * target)
+
+            self.W_u  = nn.Linear(config.u_dim, 1, bias=True) 
+            
+            self.W_yu = nn.Linear(config.u_dim, config.y_dim, bias=True)
+            self.W_y  = nn.Linear(config.y_dim, 1, bias=False) 
         
     def forward(self, inputs):
+        
         y, u_i, z_i = inputs
         
         # NON-CONVEX UPDATE: u_{i+1}
-        u_next = F.silu(self.W_uu(u_i))
+        if not self.final: u_next = F.sigmoid(self.W_uu(u_i))
+        else:              u_next = None
+                
         
         # CONVEX UPDATE: z_{i+1}
 
         zu_p = z_i * F.softplus(self.W_zu(u_i)) 
-       
-        term1 = F.linear(zu_p, F.softplus(self.W_z.weight)) 
+        #F.softplus(self.W_zu(u_i)) 
+        term1 = F.linear(zu_p, self.W_z.weight)
 
-        input_gate = self.W_yu(u_i) 
-        yu = y * input_gate 
+        yu = y * F.softplus(self.W_yu(u_i))
         term2 = self.W_y(yu)
       
         term3 = self.W_u(u_i)
         
         terms = term1 + term2 + term3
-        z_next = F.softplus(terms)**2 + 0.01*terms
+        if not self.final: z_next = F.softplus(terms) + 0.01*terms
+        else:              z_next = F.softplus(terms) #+ 0.01*terms
         return (y, u_next, z_next)
     
 class cICNN_NN(nn.Module):
@@ -95,35 +117,27 @@ class cICNN_NN(nn.Module):
         super().__init__()
         
         # 1. Initial Processing of Latent Geometry (Z from your VAE)
-        self.u_init = nn.Linear(config.u_dim, config.u_dim)
+        # self.u_init = nn.Linear(config.u_dim, config.u_dim)
         
         # Layer 0 
         # z_1 = Softplus(W_y y + W_u u_0 + b)
-        self.layer_0_y = nn.Linear(config.y_dim, config.z_dim, bias=False)
+        self.layer_0_y = nn.Linear(config.y_dim, config.z_dim, bias=True)
         self.layer_0_u = nn.Linear(config.u_dim, config.z_dim, bias=True)
         
         layers = []
         for _ in range(config.num_layers):
             layers.append(cICNN_layer(config))
-        
+        layers.append(cICNN_layer(config,final=True))
         self.hidden_layers = nn.Sequential(*layers)
-        self.final_layer = nn.Linear(config.z_dim, 1, bias=False)
         
-        target_post_softplus = 1.0 / config.z_dim
-        init_mean = math.log(math.exp(target_post_softplus) - 1.0) 
-        
-        nn.init.normal_(self.final_layer.weight, mean=init_mean, std=0.01)
-        # nn.init.normal_(self.final_layer.weight, mean=0, std=0.01)
     def _forward_raw(self, y, u):
         while u.dim() < y.dim(): u = u.unsqueeze(1)
-        u_0 = self.u_init(u)
+        # u_0 = self.u_init(u)
+        u_0 = u
         z_1 = F.softplus(self.layer_0_y(y) + self.layer_0_u(u_0))
         
-        _, _, z_out = self.hidden_layers((y, u_0, z_1))
+        _, _, W_pred = self.hidden_layers((y, u_0, z_1))
         
-        W_unact = F.linear(z_out, F.softplus(self.final_layer.weight))
-        W_pred = F.softplus(W_unact)**2 + 0.01*W_unact
-        # W_pred
         return W_pred
     
     def forward(self, strain, geometry):
@@ -132,13 +146,21 @@ class cICNN_NN(nn.Module):
             strain.requires_grad_(True)
             
         W_e = self._forward_raw(strain, geometry)
-        strain_zero = torch.zeros_like(strain, requires_grad=True)
+        # strain_zero = torch.zeros_like(strain, requires_grad=True)
+        strain_zero = torch.full_like(strain, fill_value=1e-7, requires_grad=True)
         W_zero = self._forward_raw(strain_zero, geometry)
         
         S_zero = torch.autograd.grad(W_zero, strain_zero, torch.ones_like(W_zero), create_graph=True)[0]
+        # S_zero[...,-1] *= 0.5
         linear_offset = torch.sum(S_zero * strain, dim=-1, keepdim=True)
         W_phys = W_e - W_zero - linear_offset
         
+        # E_tensor = torch.stack([torch.stack([strain[..., 0], strain[..., 2]], dim=-1),torch.stack([strain[..., 2], strain[..., 1]], dim=-1)],dim=-1)
+        # detF = torch.sqrt(torch.clamp(torch.det(2*E_tensor + torch.eye(2,device=E_tensor.device)),min=0))
+        # # print(torch.det(2*E_tensor + torch.eye(2,device=E_tensor.device)))
+        # # raise
+        # W_vol = ((detF + 1/detF - 2)**2).unsqueeze(-1)
+        # W_phys += W_vol
         return W_phys
 
     def _forward(self, strain, geometry):
@@ -221,7 +243,7 @@ class surrogateNN(nn.Module):
 
     def forward(self, geometry, strains):
         z, mu, logvar = self.encoder(geometry)
-        W_phys = self.energy_predictor(strains, z)
+        W_phys = self.energy_predictor(strains, mu)
         
         return W_phys, None, mu, logvar    
 class VRAMStorage:
@@ -243,8 +265,8 @@ class VRAMStorage:
             chunk_size = 5000 
             
             # Setup constants for physics compute
-            I = torch.eye(2, dtype=torch.float32, device=device).view(1, 1, 1, 2, 2)
-            alphas = torch.linspace(0, 1.0, 11, device=device)[1:].view(1, 1, 10, 1, 1)
+            I = torch.eye(2, dtype=torch.float32, device=device).view(1, 1, 2, 2)
+            alphas = torch.linspace(0, 1.0, 11, device=device)[1:].view(1, 10, 1, 1)
             
             for i in range(0, total_len, chunk_size):
                 end = min(i + chunk_size, total_len)
@@ -258,8 +280,9 @@ class VRAMStorage:
                 # 2. PRE-COMPUTE PHYSICS (Vectorized over chunk)
                 # Expand dims if they are [batch, 300, 2, 2] to [batch, 300, 1, 2, 2]
                 if chunk_U_max.dim() == 4: chunk_U_max = chunk_U_max.unsqueeze(2)
-                if chunk_P.dim() == 4: chunk_P = chunk_P.unsqueeze(2)
 
+                # print(chunk_U_max)
+                # raise
                 U = I + alphas * (chunk_U_max - I)
                 E = 0.5 * (torch.matmul(U.mT, U) - I)
                 
@@ -329,11 +352,12 @@ class VRAMStorage:
         print("\nApplying Origin-Preserving Global Scaling...")
         
         #alternate scaling
+        # self.std_E = 1
         self.std_E = torch.max(torch.abs(self.strains))
-        self.std_W = torch.max(torch.abs(self.energies))
+        # self.std_W = torch.max(torch.abs(self.energies))
 
         # self.std_E = torch.std(self.strains)
-        # self.std_W = torch.std(self.energies)
+        self.std_W = torch.std(self.energies)
         
         self.strains = self.strains / self.std_E
         self.energies = self.energies / self.std_W
@@ -373,56 +397,47 @@ class MetaMaterialDatasetPL(Dataset):
         energy = self.storage.energies[idx]
         strain = self.storage.strains[idx]    # Pre-computed E [300, 10, 3]
         stress = self.storage.stresses[idx]   # Pre-computed S [300, 10, 3]
+        # rotation_choice = random bool
+        # roll_choice = random int (0 to 63) x2
+        # strain_neg_choice = random bool
         
-        if self.augment:
-            # 90-degree spatial image rotation
-            image = torch.rot90(image, 1, dims=[1, 2])
+#         if self.augment:
+#             # 90-degree spatial image rotation
+#             image = torch.rot90(image, 1, dims=[1, 2])
             
-            # Mathematical 90-degree rotation in Voigt Notation: 
-            # Swap 11 and 22, and multiply 12 by -1
-            strain = strain[..., [1, 0, 2]] * self.voigt_rot_mult
-            stress = stress[..., [1, 0, 2]] * self.voigt_rot_mult
+#             # Mathematical 90-degree rotation in Voigt Notation: 
+#             # Swap 11 and 22, and multiply 12 by -1
+#             strain = strain[..., [1, 0, 2]] * self.voigt_rot_mult
+#             stress = stress[..., [1, 0, 2]] * self.voigt_rot_mult
+        if True:
+            mask = torch.rand_like(strain[..., -1]) > 0.5
+            strain[..., -1][mask] *= -1
+            stress[..., -1][mask] *= -1
+        # if self.augment:
+        #     image = torch.roll(image, shifts=(), dims=(-2, -1))
             
         return image, strain, energy/scaling, stress/scaling
     
-class FlattenedStrainDataset(Dataset):
-    def __init__(self, material_dataset, num_strains=300, num_time=10):
-        self.dataset     = material_dataset
-        self.num_strains = num_strains
-        self.num_time    = num_time
-        self.points_per_mat = num_strains * num_time 
-
-    def __len__(self):
-        return len(self.dataset) * self.points_per_mat
-
-    def __getitem__(self, idx):
-        # 1. Math to find 3D coordinates (Material, Strain Path, Time Step)
-        mat_idx = idx // self.points_per_mat           # Which material?
-        remainder = idx % self.points_per_mat          # Which point within that material?
-        
-        strain_idx = remainder // self.num_time        # Which strain path?
-        time_idx = remainder % self.num_time           # Which time step along that path?
-
-        # 2. Get the full sequence for that specific material
-        image, strains, energies, stresses = self.dataset[mat_idx]
-
-        # 3. Slice out the exactly 1 physical state at that specific time step
-        # Since energies is [300, 10, 1], slicing [strain_idx, time_idx] returns shape [1]
-        # Since stresses is [300, 10, 3], slicing [strain_idx, time_idx] returns shape [3]
-        single_strain = strains[strain_idx, time_idx]
-        single_energy = energies[strain_idx, time_idx]
-        single_stress = stresses[strain_idx, time_idx]
-
-        return image, single_strain, single_energy, single_stress
-    
-def compute_loss(W_pred, W_true, S_pred, S_true, recon_images, real_images, mu, logvar, kl_targ=80,stress_weight=0.01, phys_weight=1.0,kl_weight=0.0, varW=1.0, varS=1.0):
+def compute_loss(W_pred, W_true, S_pred0, S_true, recon_images, real_images, mu, logvar, kl_targ=80,stress_weight=0.01, phys_weight=1.0,kl_weight=0.0, varW=1.0, varS=1.0):
     
     # Physics Loss: Mean Squared Error of the Strain Energy Density
-    # loss_energy = F.mse_loss(torch.log(1e-6+W_pred), torch.log(1e-6+W_true.unsqueeze(-1)))#/varW
+    # loss_energy = F.mse_loss(torch.log(1e-5+W_pred), torch.log(1e-5+W_true.unsqueeze(-1)))#/varW
+    multiplier = torch.tensor([1.0, 1.0, 0.5], device=S_pred0.device)
+    S_pred = S_pred0 * multiplier.view(1,1,3)
+    # S_pred = S_pred0.clone()
+    # S_pred[...,-1] *= 0.5
+    
+    
+    # scale = torch.clip(torch.log1p(W_true.unsqueeze(-1)), max=1e4)
+    # mean_scale = scale.mean()
+    # loss_energy = F.mse_loss(mean_scale*W_pred/scale,mean_scale*W_true.unsqueeze(-1)/scale)
+    # loss_energy = F.huber_loss(W_pred/W_true.unsqueeze(-1) , torch.ones_like(W_pred), delta=0.3333)
+    
+    # loss_energy = F.mse_loss((W_pred/(W_true.unsqueeze(-1))),torch.ones_like(W_pred))#.pow(0.5)
     loss_energy = F.mse_loss(W_pred, W_true.unsqueeze(-1))/varW
     loss_stress = F.mse_loss(S_pred, S_true)/varS
 
-    # loss_energy = F.mse_loss((W_pred/W_true.unsqueeze(-1)),torch.ones_like(W_pred))
+    # 
     # loss_stress = F.mse_loss((S_pred+1e-3)/(S_true+1e-3), torch.ones_like(S_pred))
 
     loss_phys = loss_energy + stress_weight * loss_stress
@@ -433,6 +448,7 @@ def compute_loss(W_pred, W_true, S_pred, S_true, recon_images, real_images, mu, 
     
     total_loss =  phys_weight*loss_phys + kl_weight*torch.abs(loss_kl - kl_targ)
     loss_AE =  loss_kl
+
     return total_loss, loss_AE, loss_energy, loss_stress
 
 def save_model_checkpoint(epoch, model, optimizer, config, loss_val):
@@ -451,19 +467,50 @@ def save_model_checkpoint(epoch, model, optimizer, config, loss_val):
     }, checkpoint_path)
     
     print(f"--> [Checkpoint Saved] Epoch {epoch} at {checkpoint_path}")
+    
+def AdamWc(model, lr, wd):
+    convex_params = []
+    other_params = []
+
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+
+        if name.endswith("W_z.weight"):
+            convex_params.append(p)
+        else:
+            other_params.append(p)
+
+    return AdamW([{"params": other_params, "weight_decay": wd},{"params": convex_params, "weight_decay": 0.0},],lr=lr)
 def get_weights_epoch(epoch,config):
     Tmin = 20
-    Tmax = min(100+Tmin,config.epochs//2)
+    Tmax = 100
     
-    t = torch.clamp((torch.tensor(epoch)  - Tmin)/(Tmax - Tmin), min=0, max=1)
+    t = torch.clamp((torch.tensor(epoch)  - Tmin)/(Tmax), min=0, max=1)
     str_max  = config.stress_weight 
     kl_max   = config.kl_weight 
     st_wt    = (str_max/2)*(1-torch.cos(t*torch.pi))
     kl_wt    =  (kl_max/2)*(1-torch.cos(t*torch.pi))
     return st_wt.item(), kl_wt.item()
+
+@torch.no_grad()
+def apply_convexity_constraints(model,min_w=1e-6):
+    for module in model.modules():
+        if isinstance(module, cICNN_layer):
+            # pass
+            module.W_z.weight.clamp_(min=min_w)
+
+@torch.no_grad()
+def count_convexity_constraints(model,min_w=1e-6):
+    tot=0
+    dead=0
+    for module in model.modules():
+        if isinstance(module, cICNN_layer):
+            tot  += torch.sum(torch.where(module.W_z.weight>=1e-6,1,0))
+            dead += torch.sum(torch.where(module.W_z.weight<=1e-6,1,0))
+    return tot, dead
     
 def train_model(model, train_dataloader, val_dataloader, config, trial=None):
-    
     varW, varS = config.varW, config.varS
     str_sample = config.str_sample
     frozen=None
@@ -500,9 +547,20 @@ def train_model(model, train_dataloader, val_dataloader, config, trial=None):
     active_parameters = [p for p in model.parameters() if p.requires_grad]
     
     optimizer = AdamW(active_parameters, lr=lr, weight_decay=wd)
-    warmup_scheduler = LinearLR(optimizer, start_factor=0.001, total_iters=20)
+    # optimizer = AdamWc(model, lr=lr, wd=wd)
+    eta_min = 1e-6
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.001, total_iters=20)
+    hold_scheduler   = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=80)
+    decay_scheduler   = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs-100, eta_min=eta_min)
+    hold_scheduler2  = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=(eta_min/lr), total_iters=200)
+    warmup_scheduler = torch.optim.lr_scheduler.SequentialLR(
+                                                            optimizer,
+                                                            schedulers=[warmup_scheduler, hold_scheduler, decay_scheduler],
+                                                            milestones=[20, 100]
+                                                            )
+    
     model.to(device)
-    # apply_convexity_constraints(model)
+    apply_convexity_constraints(model)
     
     import time
     from collections import deque
@@ -558,9 +616,9 @@ def train_model(model, train_dataloader, val_dataloader, config, trial=None):
             # Backward pass and optimize
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
             optimizer.step()
-            
+            apply_convexity_constraints(model)
+            tot, dead = count_convexity_constraints(model)
             
             epoch_loss += l_ae.detach().item()
             epoch_energy += l_energy.detach().item()
@@ -610,9 +668,9 @@ def train_model(model, train_dataloader, val_dataloader, config, trial=None):
             
             val_loss, vl_ae, l_energy_val, l_stress_val = compute_loss(
                 W_pred_val, val_energies, S_pred_val, val_stresses, recon_val, val_images, mu_val, logvar_val,
-                varW=varW,varS=varS,stress_weight=st_wt, phys_weight=p_wt, kl_targ=kl_t)
+                varW=varW,varS=varS,stress_weight=st_wt, phys_weight=p_wt, kl_weight=kl_wt, kl_targ=kl_t)
             
-            val_epoch_loss += l_ae.detach().item()
+            val_epoch_loss += vl_ae.detach().item()
             val_epoch_energy += l_energy_val.detach().item()
             val_epoch_stress += l_stress_val.detach().item()
             
@@ -624,6 +682,7 @@ def train_model(model, train_dataloader, val_dataloader, config, trial=None):
         #         PRINTING
         # ==========================
         print(f"Epoch [{epoch+1}/{epochs}] Time: {time.time() - start_time:.1f}s")
+        print(f"  Total: {tot} | Dead: {dead}| lr = {optimizer.param_groups[0]['lr']}")
         print(f"  [Train] AE Loss: {avg_train_loss:.4f} | Energy MSE: {avg_train_energy:.6f} | Stress MSE: {avg_train_stress:.6f}")
         print(f"  [Val]   AE Loss: {avg_val_loss:.4f} | Energy MSE: {avg_val_energy:.6f} | Stress MSE: {avg_val_stress:.6f}\n")
         if config.save==True and epoch%50==0:
@@ -644,22 +703,39 @@ def train_model(model, train_dataloader, val_dataloader, config, trial=None):
         recent_val_losses.append(out_loss)
     
     best_val_loss = min(recent_val_losses) if recent_val_losses else float('inf')     
-    if config.save==True: save_model_checkpoint(epoch, model, optimizer, config, avg_train_loss)
+    if config.save==True: 
+        save_model_checkpoint(epoch, model, optimizer, config, avg_train_loss)
+        
     return best_val_loss
               
 def optuna_objective(trial, train_dataset, val_dataset):
-
-    config = hyper_parameters(  epochs        =  200,
+    
+    try:
+        dataset = train_dataset.dataset.storage
+        indices = train_dataset.indices
+        varW = torch.var(dataset.energies[indices], unbiased=False)
+        varS = torch.var(dataset.stresses[indices], unbiased=False)
+    except:
+        try:
+            dataset = train_dataset.dataset.dataset.storage
+            indices = [train_dataset.dataset.indices[i] for i in train_dataset.indices]
+            varW = torch.var(dataset.energies[indices], unbiased=False)
+            varS = torch.var(dataset.stresses[indices], unbiased=False)
+        except:
+            varW, varS = 1.0, 1.0
+            
+    config = hyper_parameters(  epochs        =  200, varW = varW, varS = varS, 
                                 u_dim         =  trial.suggest_categorical("u_dim", [8, 16, 32, 64]),
-                                z_dim         =  trial.suggest_categorical("z_dim", [64, 128, 266, 512]),
-                                num_layers    =  trial.suggest_int("num_layers", 2, 6),
+                                z_dim         =  trial.suggest_categorical("z_dim", [64, 128, 256, 512]),
+                                num_layers    =  trial.suggest_int("num_layers", 3, 5),
                                 lr            =  trial.suggest_float("lr", 1e-5, 1e-2, log=True),
-                                weight_decay  =  trial.suggest_float("weight_decay", 1e-5, 1e-2, log=True),
-                                batch_size    =  trial.suggest_categorical("batch_size", [8, 16, 32, 64, 128, 256]),
-                                str_sample    =  trial.suggest_categorical("str_sample", [32, 64, 128, 256, 512, 1024]),
-                                stress_weight =  trial.suggest_float("stress_weight", 1e-3, 10, log=True),
-                                kl_weight     =  trial.suggest_float("kl_weight", 1e-6, 1.0, log=True)
+                                weight_decay  =  trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True),
+                                batch_size    =  trial.suggest_categorical("batch_size", [64, 128, 256]),
+                                str_sample    =  trial.suggest_categorical("str_sample", [64, 128, 256]),
+                                stress_weight =  2,
+                                kl_weight     =  5e-4
                               )
+
     dataloader_train = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=0, pin_memory=False)
     dataloader_val   = DataLoader(val_dataset,   batch_size=config.batch_size, shuffle=False,num_workers=0, pin_memory=False)
 
