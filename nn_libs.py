@@ -740,9 +740,18 @@ def train_model(model, train_dataloader, val_dataloader, config, trial=None):
             
             # Stresses using autograd
             S_pred = torch.autograd.grad(W_pred, strains, torch.ones_like(W_pred), create_graph=True)[0]
-            # C_pred = torch.autograd.grad(S_pred, strains, torch.ones_like(S_pred), create_graph=True)[0]
-            def energy_wrapper(strain_input): return model(images, strain_input)[0].sum()
-            C_pred = vmap(hessian(energy_wrapper), randomness='different')(strains)
+            C_pred = torch.zeros(*strains.shape, 3,3, device=strains.device, dtype=strains.dtype)
+            for i in range(strains.shape[-1]):
+                grad_outputs = torch.zeros_like(S_pred)
+                grad_outputs[..., i] = 1.0
+
+                C_pred[..., i, :] = torch.autograd.grad(
+                    outputs=S_pred,
+                    inputs=strains,
+                    grad_outputs=grad_outputs,
+                    create_graph=True,
+                    retain_graph=True
+                )[0]
             
             loss, l_ae, l_energy, l_stress = compute_loss2(
                 W_pred, energies_true, S_pred, stresses_true, C_pred, tangents_true, recon_images, images, mu, logvar,
@@ -800,8 +809,18 @@ def train_model(model, train_dataloader, val_dataloader, config, trial=None):
             
             # Stresses using autograd
             S_pred_val = torch.autograd.grad(W_pred_val, val_strains, torch.ones_like(W_pred_val), create_graph=True)[0]
-            def energy_wrapper(strain_input): return model(images, strain_input)[0].sum()
-            C_pred_val = vmap(hessian(energy_wrapper), randomness='different')(strains)
+            C_pred_val = torch.zeros(*strains.shape, 3,3, device=strains.device, dtype=strains.dtype)
+            for i in range(strains.shape[-1]):
+                grad_outputs = torch.zeros_like(S_pred)
+                grad_outputs[..., i] = 1.0
+
+                C_pred_val[..., i, :] = torch.autograd.grad(
+                    outputs=S_pred_val,
+                    inputs=strains,
+                    grad_outputs=grad_outputs,
+                    create_graph=True,
+                    retain_graph=True
+                )[0]
             val_loss, vl_ae, l_energy_val, l_stress_val = compute_loss2(
                 W_pred_val, val_energies, S_pred_val, val_stresses, C_pred_val,val_tangents, recon_val, val_images, mu_val, logvar_val,
                 varW=varW,varS=varS,stress_weight=st_wt, phys_weight=p_wt, kl_weight=kl_wt, kl_targ=kl_t)
